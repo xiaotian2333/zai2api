@@ -1,0 +1,50 @@
+# Binaries
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+zai-proxy
+main
+*.txt
+# Build output
+/bin/
+/build/
+/dist/
+
+# Test binary
+*.test
+
+# Output of go coverage tool
+*.out
+
+# Dependency directories
+/vendor/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Environment files
+.env
+
+# Data files (contains sensitive tokens)
+/data/tokens.txt
+
+# Test files
+test.txt
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Debug files
+*.log
+debug/
+
+# Temporary files
+*.tmp
+*.temp
