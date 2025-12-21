@@ -5,9 +5,11 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"mime/multipart"
 	"net/http"
+	"net/textproto"
 	"path/filepath"
 	"strings"
 	"time"
@@ -109,15 +111,11 @@ func getExtFromMime(contentType string, mediaType MediaType) string {
 	return ".png"
 }
 
-// parseBase64Data 解析 base64 数据 URL
 func parseBase64Data(dataURL string) (data []byte, contentType string, err error) {
-	// 格式: data:image/jpeg;base64,/9j/4AAQ... 或 data:video/mp4;base64,...
 	parts := strings.SplitN(dataURL, ",", 2)
 	if len(parts) != 2 {
 		return nil, "", ErrRequestFailed
 	}
-
-	// 解析 MIME 类型
 	header := parts[0]
 	if idx := strings.Index(header, ":"); idx != -1 {
 		mimeAndEncoding := header[idx+1:]
@@ -135,32 +133,102 @@ func parseBase64Data(dataURL string) (data []byte, contentType string, err error
 	return data, contentType, nil
 }
 
-// downloadFromURL 从 URL 下载文件
+func isValidMediaMagicBytes(data []byte) bool {
+	if len(data) < 12 {
+		return false
+	}
+	// PNG: 89 50 4E 47
+	if data[0] == 0x89 && data[1] == 0x50 && data[2] == 0x4E && data[3] == 0x47 {
+		return true
+	}
+	// JPEG: FF D8 FF
+	if data[0] == 0xFF && data[1] == 0xD8 && data[2] == 0xFF {
+		return true
+	}
+	// GIF: 47 49 46 38
+	if data[0] == 0x47 && data[1] == 0x49 && data[2] == 0x46 && data[3] == 0x38 {
+		return true
+	}
+	// WebP: 52 49 46 46 ... 57 45 42 50
+	if data[0] == 0x52 && data[1] == 0x49 && data[2] == 0x46 && data[3] == 0x46 &&
+		len(data) > 11 && data[8] == 0x57 && data[9] == 0x45 && data[10] == 0x42 && data[11] == 0x50 {
+		return true
+	}
+	// BMP: 42 4D
+	if data[0] == 0x42 && data[1] == 0x4D {
+		return true
+	}
+	// MP4/MOV: ftyp at offset 4
+	if len(data) > 11 && data[4] == 0x66 && data[5] == 0x74 && data[6] == 0x79 && data[7] == 0x70 {
+		return true
+	}
+	// WebM/MKV: 1A 45 DF A3
+	if data[0] == 0x1A && data[1] == 0x45 && data[2] == 0xDF && data[3] == 0xA3 {
+		return true
+	}
+	return false
+}
+
 func downloadFromURL(url string) (data []byte, contentType string, filename string, err error) {
-	client := &http.Client{Timeout: 60 * time.Second}
-	resp, err := client.Get(url)
+	urlPreview := url
+	if len(urlPreview) > 80 {
+		urlPreview = urlPreview[:80] + "..."
+	}
+	LogDebug("[Download] Starting: %s", urlPreview)
+
+	client := &http.Client{
+		Timeout: 60 * time.Second,
+		Transport: &http.Transport{
+			DisableKeepAlives: true,
+		},
+	}
+
+	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
-		LogError("download error: %v", err)
+		LogError("[Download] create request error: %v", err)
+		return nil, "", "", ErrRequestFailed
+	}
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+	req.Header.Set("Accept", "image/*, video/*, */*")
+	if strings.Contains(url, "qq.com") {
+		req.Header.Set("Referer", "https://qq.com/")
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		LogError("[Download] request error: %v", err)
 		return nil, "", "", ErrRequestFailed
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		LogError("download failed: status %d", resp.StatusCode)
+		LogError("[Download] failed: status %d", resp.StatusCode)
 		return nil, "", "", ErrRequestFailed
 	}
 
 	data, err = io.ReadAll(resp.Body)
 	if err != nil {
-		LogError("read response error: %v", err)
+		LogError("[Download] read body error: %v", err)
 		return nil, "", "", ErrRequestFailed
 	}
 
 	contentType = resp.Header.Get("Content-Type")
+	LogDebug("[Download] Success: size=%d, contentType=%s", len(data), contentType)
+
+	// 使用 magic bytes 验证是否为有效媒体文件
+	if !isValidMediaMagicBytes(data) {
+		LogError("[Download] invalid media (magic bytes), contentType=%s, size=%d", contentType, len(data))
+		return nil, "", "", ErrRequestFailed
+	}
+
 	filename = filepath.Base(url)
 	// 去掉 URL 参数
 	if idx := strings.Index(filename, "?"); idx != -1 {
 		filename = filename[:idx]
+	}
+	// 检查文件名是否有效（必须包含扩展名）
+	if !strings.Contains(filename, ".") || len(filename) < 3 {
+		filename = ""
 	}
 	return data, contentType, filename, nil
 }
@@ -171,9 +239,18 @@ func uploadToZAI(token string, data []byte, filename string, contentType string)
 	var buf bytes.Buffer
 	writer := multipart.NewWriter(&buf)
 
-	part, err := writer.CreateFormFile("file", filename)
+	// 创建带正确Content-Type的form part
+	h := make(textproto.MIMEHeader)
+	h.Set("Content-Disposition", fmt.Sprintf(`form-data; name="file"; filename="%s"`, filename))
+	if contentType != "" {
+		h.Set("Content-Type", contentType)
+	} else {
+		h.Set("Content-Type", "application/octet-stream")
+	}
+
+	part, err := writer.CreatePart(h)
 	if err != nil {
-		LogError("create form file error: %v", err)
+		LogError("create form part error: %v", err)
 		return nil, ErrRequestFailed
 	}
 
@@ -191,10 +268,34 @@ func uploadToZAI(token string, data []byte, filename string, contentType string)
 
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("Content-Type", writer.FormDataContentType())
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8,en-GB;q=0.7,en-US;q=0.6")
+	req.Header.Set("Cache-Control", "no-cache")
+	req.Header.Set("Connection", "keep-alive")
+	req.Header.Set("Cookie", "token="+token)
+	req.Header.Set("Pragma", "no-cache")
 	req.Header.Set("Origin", "https://chat.z.ai")
 	req.Header.Set("Referer", "https://chat.z.ai/")
+	req.Header.Set("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36 Edg/142.0.0.0")
+	req.Header.Set("Sec-Ch-Ua", `"Chromium";v="142", "Microsoft Edge";v="142", "Not_A Brand";v="99"`)
+	req.Header.Set("Sec-Ch-Ua-Mobile", "?0")
+	req.Header.Set("Sec-Ch-Ua-Platform", `"Linux"`)
+	req.Header.Set("Sec-Fetch-Dest", "empty")
+	req.Header.Set("Sec-Fetch-Mode", "cors")
+	req.Header.Set("Sec-Fetch-Site", "same-origin")
+	req.Header.Set("Sec-Gpc", "1")
+	req.Header.Set("DNT", "1")
+	randomIP := generateRandomIP()
+	req.Header.Set("X-Forwarded-For", randomIP)
+	req.Header.Set("X-Real-IP", randomIP)
 
-	client := &http.Client{Timeout: 120 * time.Second}
+	client := &http.Client{
+		Timeout: 120 * time.Second,
+		Transport: &http.Transport{
+			DisableKeepAlives: true,
+		},
+	}
+
 	resp, err := client.Do(req)
 	if err != nil {
 		LogError("upload request error: %v", err)
@@ -202,13 +303,15 @@ func uploadToZAI(token string, data []byte, filename string, contentType string)
 	}
 	defer resp.Body.Close()
 
+	respBody, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
-		body, _ := io.ReadAll(resp.Body)
-		LogError("upload failed: status %d, body: %s", resp.StatusCode, string(body))
+		errBody := string(respBody)
+		if len(errBody) > 200 {
+			errBody = errBody[:200] + "..."
+		}
+		LogError("[Upload] failed: status %d, body: %s", resp.StatusCode, errBody)
 		return nil, ErrRequestFailed
 	}
-
-	respBody, _ := io.ReadAll(resp.Body)
 	LogDebug("[UploadToZAI] Response body: %s", string(respBody))
 
 	var uploadResp FileUploadResponse
@@ -218,6 +321,23 @@ func uploadToZAI(token string, data []byte, filename string, contentType string)
 	}
 	LogDebug("[UploadToZAI] Parsed response: id=%s, filename=%s, size=%d", uploadResp.ID, uploadResp.Filename, uploadResp.Meta.Size)
 	return &uploadResp, nil
+}
+
+// isUnsupportedMediaURL 检查是否为不支持的媒体URL（如QQ临时链接只有appid没有文件id）
+func isUnsupportedMediaURL(url string) bool {
+	// QQ多媒体链接：如果只有appid参数没有实际文件id则跳过
+	// 例如 https://multimedia.nt.qq.com.cn/download?appid=140 这种无效链接
+	if strings.Contains(url, "multimedia.nt.qq.com.cn/download") {
+		// 检查是否只有appid参数（没有其他参数如fileid等）
+		if idx := strings.Index(url, "?"); idx != -1 {
+			query := url[idx+1:]
+			// 如果参数很短（只有appid=xxx），认为是无效链接
+			if len(query) < 20 || !strings.Contains(query, "&") {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // UploadMedia 通用媒体上传（支持图片和视频，支持 base64 和 URL）
@@ -232,6 +352,12 @@ func UploadMedia(token string, mediaURL string, mediaType MediaType) (*UpstreamF
 		urlPreview = urlPreview[:100] + "..."
 	}
 	LogDebug("[Upload] Starting upload: type=%s, url=%s", mediaType, urlPreview)
+
+	// 跳过不支持的URL
+	if isUnsupportedMediaURL(mediaURL) {
+		LogDebug("[Upload] Skipping unsupported media URL: %s", urlPreview)
+		return nil, nil
+	}
 
 	if strings.HasPrefix(mediaURL, "data:") {
 		// Base64 编码
@@ -262,7 +388,7 @@ func UploadMedia(token string, mediaURL string, mediaType MediaType) (*UpstreamF
 		}
 		LogDebug("[Upload] Downloaded from URL: filename=%s, contentType=%s, size=%d bytes", filename, contentType, len(fileData))
 		// 检查文件名有效性
-		if filename == "" || filename == "." || filename == "/" {
+		if filename == "" || !strings.Contains(filename, ".") {
 			if contentType == "" {
 				if mediaType == MediaTypeVideo {
 					contentType = "video/mp4"
@@ -271,7 +397,7 @@ func UploadMedia(token string, mediaURL string, mediaType MediaType) (*UpstreamF
 				}
 			}
 			ext := getExtFromMime(contentType, mediaType)
-			filename = uuid.New().String()[:12] + ext
+			filename = fmt.Sprintf("pasted_%s_%d%s", mediaType, time.Now().UnixMilli(), ext)
 		}
 	}
 
@@ -327,6 +453,10 @@ func UploadImages(token string, imageURLs []string) ([]*UpstreamFile, error) {
 			LogError("upload image failed: %s - %v", url[:min(50, len(url))], err)
 			continue
 		}
+		if file == nil {
+			LogDebug("[UploadImages] Image %d skipped (unsupported URL)", i+1)
+			continue
+		}
 		LogDebug("[UploadImages] Image %d uploaded: id=%s", i+1, file.ID)
 		files = append(files, file)
 	}
@@ -343,6 +473,10 @@ func UploadVideos(token string, videoURLs []string) ([]*UpstreamFile, error) {
 		file, err := UploadVideoFromURL(token, url)
 		if err != nil {
 			LogError("upload video failed: %s - %v", url[:min(50, len(url))], err)
+			continue
+		}
+		if file == nil {
+			LogDebug("[UploadVideos] Video %d skipped (unsupported URL)", i+1)
 			continue
 		}
 		LogDebug("[UploadVideos] Video %d uploaded: id=%s", i+1, file.ID)

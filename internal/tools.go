@@ -8,54 +8,47 @@ import (
 	"time"
 )
 
-// Tool OpenAI 工具定义
 type Tool struct {
 	Type     string       `json:"type"`
 	Function ToolFunction `json:"function,omitempty"`
 }
 
-// ToolFunction 函数定义
 type ToolFunction struct {
 	Name        string          `json:"name"`
 	Description string          `json:"description,omitempty"`
 	Parameters  json.RawMessage `json:"parameters,omitempty"`
 }
-
-// ToolCall 工具调用
 type ToolCall struct {
 	Index    int              `json:"index,omitempty"`
 	ID       string           `json:"id"`
 	Type     string           `json:"type"`
 	Function ToolCallFunction `json:"function"`
 }
-
-// ToolCallFunction 工具调用的函数信息
 type ToolCallFunction struct {
 	Name      string `json:"name"`
 	Arguments string `json:"arguments"`
 }
 
 var (
-	toolCallFencePattern = regexp.MustCompile("(?s)```json\\s*(\\{.*?\\})\\s*```")
-	functionCallPattern  = regexp.MustCompile(`(?s)调用函数\s*[：:]\s*([\w\-\.]+)\s*(?:参数|arguments)[：:]\s*(\{.*?\})`)
+	toolCallFencePattern  = regexp.MustCompile("(?s)```json\\s*(\\{.*?\\})\\s*```")
+	functionCallPattern   = regexp.MustCompile(`(?s)调用函数\s*[：:]\s*([\w\-\.]+)\s*(?:参数|arguments)[：:]\s*(\{.*?\})`)
+	singleFunctionPattern = regexp.MustCompile(`(?s)\{\s*"name"\s*:\s*"([^"]+)"\s*,\s*"arguments"\s*:\s*(\{[^}]*\}|"[^"]*")\s*\}`)
 )
 
-// GenerateToolPrompt 生成工具注入提示
-func GenerateToolPrompt(tools []Tool) string {
+func GenerateToolPrompt(tools []Tool, toolChoice interface{}) string {
 	if len(tools) == 0 {
 		return ""
 	}
-
 	var toolDefs []string
+	var toolNames []string
 	for _, tool := range tools {
 		if tool.Type != "function" {
 			continue
 		}
 
 		fn := tool.Function
-		toolInfo := fmt.Sprintf("## %s\n**Purpose**: %s", fn.Name, fn.Description)
-
-		// 解析参数
+		toolNames = append(toolNames, fn.Name)
+		toolInfo := fmt.Sprintf("### %s\n%s", fn.Name, fn.Description)
 		if len(fn.Parameters) > 0 {
 			var params struct {
 				Type       string                 `json:"type"`
@@ -68,20 +61,30 @@ func GenerateToolPrompt(tools []Tool) string {
 					requiredSet[r] = true
 				}
 
-				toolInfo += "\n**Parameters**:"
+				toolInfo += "\n**参数:**"
 				for name, details := range params.Properties {
 					detailMap, _ := details.(map[string]interface{})
 					paramType, _ := detailMap["type"].(string)
 					paramDesc, _ := detailMap["description"].(string)
-					reqFlag := "*Optional*"
+					enumVals, hasEnum := detailMap["enum"].([]interface{})
+
+					reqMark := ""
 					if requiredSet[name] {
-						reqFlag = "**Required**"
+						reqMark = " (必填)"
 					}
-					toolInfo += fmt.Sprintf("\n- `%s` (%s) - %s: %s", name, paramType, reqFlag, paramDesc)
+
+					paramLine := fmt.Sprintf("\n- **%s** (%s%s): %s", name, paramType, reqMark, paramDesc)
+					if hasEnum && len(enumVals) > 0 {
+						var enumStrs []string
+						for _, e := range enumVals {
+							enumStrs = append(enumStrs, fmt.Sprintf("`%v`", e))
+						}
+						paramLine += fmt.Sprintf(" [可选值: %s]", strings.Join(enumStrs, ", "))
+					}
+					toolInfo += paramLine
 				}
 			}
 		}
-
 		toolDefs = append(toolDefs, toolInfo)
 	}
 
@@ -89,40 +92,50 @@ func GenerateToolPrompt(tools []Tool) string {
 		return ""
 	}
 
-	return "\n\n# AVAILABLE FUNCTIONS\n" + strings.Join(toolDefs, "\n\n---\n") + `
+	instructions := getToolChoiceInstructions(toolChoice, toolNames)
+	return "\n\n# 可用工具\n" + strings.Join(toolDefs, "\n\n") + "\n\n" + instructions
+}
 
-# USAGE INSTRUCTIONS
-When you need to execute a function, respond ONLY with a JSON object containing tool_calls:
+func getToolChoiceInstructions(toolChoice interface{}, toolNames []string) string {
+	baseInstructions := `# 工具调用格式
+当需要调用工具时，请严格按照以下 JSON 格式输出：
 ` + "```json" + `
-{
-  "tool_calls": [
-    {
-      "id": "call_xxx",
-      "type": "function",
-      "function": {
-        "name": "function_name",
-        "arguments": "{\"param1\": \"value1\"}"
-      }
-    }
-  ]
-}
+{"tool_calls":[{"id":"call_1","type":"function","function":{"name":"函数名","arguments":"{\"参数名\":\"参数值\"}"}}]}
 ` + "```" + `
-Important: No explanatory text before or after the JSON. The 'arguments' field must be a JSON string, not an object.
-`
+**重要规则：**
+1. arguments 字段必须是 JSON 字符串（双引号包裹），不是对象
+2. 调用工具时只输出 JSON，不要添加任何解释文字
+3. 可以在 tool_calls 数组中同时调用多个工具`
+
+	switch tc := toolChoice.(type) {
+	case string:
+		if tc == "auto" {
+			return baseInstructions + "\n4. 根据用户需求自行判断是否需要调用工具"
+		} else if tc == "required" {
+			return baseInstructions + "\n4. **必须**调用至少一个工具来响应用户请求"
+		}
+	case map[string]interface{}:
+		if tc["type"] == "function" {
+			if fn, ok := tc["function"].(map[string]interface{}); ok {
+				if name, ok := fn["name"].(string); ok {
+					return baseInstructions + fmt.Sprintf("\n4. **必须**调用 `%s` 工具来响应用户请求", name)
+				}
+			}
+		}
+	}
+
+	return baseInstructions + "\n4. 根据用户需求自行判断是否需要调用工具"
 }
 
-// ProcessMessagesWithTools 处理消息并注入工具提示
 func ProcessMessagesWithTools(messages []Message, tools []Tool, toolChoice interface{}) []Message {
 	if !Cfg.ToolSupport || len(tools) == 0 {
 		return messages
 	}
-
-	// 检查 tool_choice
 	if tc, ok := toolChoice.(string); ok && tc == "none" {
 		return messages
 	}
 
-	toolPrompt := GenerateToolPrompt(tools)
+	toolPrompt := GenerateToolPrompt(tools, toolChoice)
 	if toolPrompt == "" {
 		return messages
 	}
@@ -130,35 +143,77 @@ func ProcessMessagesWithTools(messages []Message, tools []Tool, toolChoice inter
 	processed := make([]Message, len(messages))
 	copy(processed, messages)
 
-	// 找到 system 消息并追加工具提示
+	// 处理 tool 角色消息，转换为 user 消息
+	for i, msg := range processed {
+		if msg.Role == "tool" {
+			processed[i] = convertToolMessage(msg)
+		}
+	}
+
 	hasSystem := false
 	for i, msg := range processed {
 		if msg.Role == "system" {
 			hasSystem = true
-			content, _ := msg.ParseContent()
-			processed[i].Content = content + toolPrompt
+			processed[i].Content = appendTextToContent(msg.Content, toolPrompt)
 			break
 		}
 	}
-
-	// 如果没有 system 消息，创建一个
 	if !hasSystem {
 		systemMsg := Message{
 			Role:    "system",
-			Content: "你是一个有用的助手。" + toolPrompt,
+			Content: "你是一个智能助手，能够帮助用户完成各种任务。" + toolPrompt,
 		}
 		processed = append([]Message{systemMsg}, processed...)
 	}
 
-	// 添加工具使用提示
-	if toolChoice == "required" || toolChoice == "auto" {
-		if len(processed) > 0 && processed[len(processed)-1].Role == "user" {
-			content, _ := processed[len(processed)-1].ParseContent()
-			processed[len(processed)-1].Content = content + "\n\n请根据需要使用提供的工具函数。"
-		}
-	}
-
 	return processed
+}
+
+func convertToolMessage(msg Message) Message {
+	content, _ := msg.ParseContent()
+	return Message{
+		Role:    "user",
+		Content: fmt.Sprintf("[工具调用结果]\n%s", content),
+	}
+}
+
+func appendTextToContent(content interface{}, suffix string) interface{} {
+	switch c := content.(type) {
+	case string:
+		return c + suffix
+	case []interface{}:
+		result := make([]interface{}, len(c))
+		copy(result, c)
+		lastTextIdx := -1
+		for i, item := range result {
+			if part, ok := item.(map[string]interface{}); ok {
+				if partType, _ := part["type"].(string); partType == "text" {
+					lastTextIdx = i
+				}
+			}
+		}
+
+		if lastTextIdx >= 0 {
+			if part, ok := result[lastTextIdx].(map[string]interface{}); ok {
+				newPart := make(map[string]interface{})
+				for k, v := range part {
+					newPart[k] = v
+				}
+				if text, ok := newPart["text"].(string); ok {
+					newPart["text"] = text + suffix
+				}
+				result[lastTextIdx] = newPart
+			}
+		} else {
+			result = append(result, map[string]interface{}{
+				"type": "text",
+				"text": suffix,
+			})
+		}
+		return result
+	default:
+		return content
+	}
 }
 
 // ExtractToolInvocations 从响应文本中提取工具调用
@@ -172,24 +227,37 @@ func ExtractToolInvocations(text string) []ToolCall {
 	if len(scanText) > Cfg.ScanLimit {
 		scanText = scanText[:Cfg.ScanLimit]
 	}
+
+	// 方法1: 从 JSON fence 中提取
 	matches := toolCallFencePattern.FindAllStringSubmatch(scanText, -1)
 	for _, match := range matches {
 		if len(match) > 1 {
 			if calls := parseToolCallsJSON(match[1]); calls != nil {
+				LogDebug("[ExtractToolInvocations] Found %d tool calls in JSON fence", len(calls))
 				return calls
 			}
 		}
 	}
+
+	// 方法2: 提取内联 JSON
 	if calls := extractInlineToolCalls(scanText); calls != nil {
+		LogDebug("[ExtractToolInvocations] Found %d tool calls inline", len(calls))
 		return calls
 	}
 
-	// 方法3: 解析自然语言函数调用
+	// 方法3: 提取单个函数调用格式 {"name":"...","arguments":"..."}
+	if calls := extractSingleFunctionCall(scanText); calls != nil {
+		LogDebug("[ExtractToolInvocations] Found single function call")
+		return calls
+	}
+
+	// 方法4: 解析自然语言函数调用
 	if match := functionCallPattern.FindStringSubmatch(scanText); len(match) > 2 {
 		funcName := strings.TrimSpace(match[1])
 		argsStr := strings.TrimSpace(match[2])
 		var args interface{}
 		if err := json.Unmarshal([]byte(argsStr), &args); err == nil {
+			LogDebug("[ExtractToolInvocations] Found natural language function call: %s", funcName)
 			return []ToolCall{{
 				ID:   generateCallID(),
 				Type: "function",
@@ -204,6 +272,34 @@ func ExtractToolInvocations(text string) []ToolCall {
 	return nil
 }
 
+func extractSingleFunctionCall(text string) []ToolCall {
+	matches := singleFunctionPattern.FindStringSubmatch(text)
+	if len(matches) < 3 {
+		return nil
+	}
+
+	funcName := matches[1]
+	argsRaw := matches[2]
+
+	var argsStr string
+	if strings.HasPrefix(argsRaw, "\"") {
+		if err := json.Unmarshal([]byte(argsRaw), &argsStr); err != nil {
+			argsStr = argsRaw
+		}
+	} else {
+		argsStr = argsRaw
+	}
+
+	return []ToolCall{{
+		ID:   generateCallID(),
+		Type: "function",
+		Function: ToolCallFunction{
+			Name:      funcName,
+			Arguments: argsStr,
+		},
+	}}
+}
+
 func parseToolCallsJSON(jsonStr string) []ToolCall {
 	var data struct {
 		ToolCalls []struct {
@@ -212,15 +308,12 @@ func parseToolCallsJSON(jsonStr string) []ToolCall {
 			Function interface{} `json:"function"`
 		} `json:"tool_calls"`
 	}
-
 	if err := json.Unmarshal([]byte(jsonStr), &data); err != nil {
 		return nil
 	}
-
 	if len(data.ToolCalls) == 0 {
 		return nil
 	}
-
 	var calls []ToolCall
 	for _, tc := range data.ToolCalls {
 		call := ToolCall{
@@ -230,8 +323,6 @@ func parseToolCallsJSON(jsonStr string) []ToolCall {
 		if call.Type == "" {
 			call.Type = "function"
 		}
-
-		// 处理 function 字段
 		if fn, ok := tc.Function.(map[string]interface{}); ok {
 			call.Function.Name, _ = fn["name"].(string)
 			if args, ok := fn["arguments"]; ok {
@@ -301,9 +392,7 @@ func extractInlineToolCalls(text string) []ToolCall {
 	return nil
 }
 
-// RemoveToolJSONContent 从响应中移除工具调用 JSON
 func RemoveToolJSONContent(text string) string {
-	// 移除代码块中的工具调用
 	result := toolCallFencePattern.ReplaceAllStringFunc(text, func(match string) string {
 		submatch := toolCallFencePattern.FindStringSubmatch(match)
 		if len(submatch) > 1 {
@@ -316,8 +405,6 @@ func RemoveToolJSONContent(text string) string {
 		}
 		return match
 	})
-
-	// 移除内联工具调用 JSON
 	result = removeInlineToolCallJSON(result)
 
 	return strings.TrimSpace(result)
@@ -333,8 +420,6 @@ func removeInlineToolCallJSON(text string) string {
 			i++
 			continue
 		}
-
-		// 找匹配的右括号
 		braceCount := 1
 		inString := false
 		escapeNext := false
@@ -371,7 +456,6 @@ func removeInlineToolCallJSON(text string) string {
 			var data map[string]interface{}
 			if err := json.Unmarshal([]byte(jsonStr), &data); err == nil {
 				if _, ok := data["tool_calls"]; ok {
-					// 跳过工具调用 JSON
 					i = j
 					continue
 				}

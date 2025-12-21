@@ -64,43 +64,31 @@ func GetTargetModel(model string) string {
 	return model
 }
 
-// IsValidModel 验证模型是否有效
 func IsValidModel(model string) bool {
 	baseModel, _, _ := ParseModelName(model)
-	// 检查基础模型映射
 	if _, ok := BaseModelMapping[baseModel]; ok {
 		return true
 	}
-	// 检查动态模型配置
 	if GetUpstreamConfig(model) != nil {
 		return true
 	}
 	return false
 }
-
-// OpenAI 格式的消息内容项
 type ContentPart struct {
 	Type     string    `json:"type"`
 	Text     string    `json:"text,omitempty"`
 	ImageURL *MediaURL `json:"image_url,omitempty"`
 	VideoURL *MediaURL `json:"video_url,omitempty"`
 }
-
-// MediaURL 媒体 URL（图片或视频）
 type MediaURL struct {
 	URL string `json:"url"`
 }
 
-// ImageURL 兼容旧版本
 type ImageURL = MediaURL
-
-// Message 支持纯文本和多模态内容
 type Message struct {
 	Role    string      `json:"role"`
 	Content interface{} `json:"content"` // string 或 []ContentPart
 }
-
-// ParseContent 解析消息内容，返回文本、图片URL列表和视频URL列表
 func (m *Message) ParseContent() (text string, imageURLs []string) {
 	_, imageURLs, _ = m.ParseContentFull()
 	text, _, _ = m.ParseContentFull()
@@ -147,13 +135,8 @@ func (m *Message) ToUpstreamMessage(urlToFileID map[string]string) map[string]in
 			"content": text,
 		}
 	}
+
 	var content []interface{}
-	if text != "" {
-		content = append(content, map[string]interface{}{
-			"type": "text",
-			"text": text,
-		})
-	}
 	for _, imgURL := range imageURLs {
 		urlPreview := imgURL
 		if len(urlPreview) > 60 {
@@ -171,18 +154,35 @@ func (m *Message) ToUpstreamMessage(urlToFileID map[string]string) map[string]in
 			LogDebug("[ToUpstreamMessage] Image NOT matched: %s", urlPreview)
 		}
 	}
-	// 添加视频
 	for _, vidURL := range videoURLs {
+		urlPreview := vidURL
+		if len(urlPreview) > 60 {
+			urlPreview = urlPreview[:60] + "..."
+		}
 		if fileID, ok := urlToFileID[vidURL]; ok {
+			LogDebug("[ToUpstreamMessage] Video MATCHED: %s -> %s", urlPreview, fileID)
 			content = append(content, map[string]interface{}{
 				"type": "video_url",
 				"video_url": map[string]interface{}{
 					"url": fileID,
 				},
 			})
+		} else {
+			LogDebug("[ToUpstreamMessage] Video NOT matched: %s", urlPreview)
 		}
 	}
-
+	if text != "" {
+		content = append(content, map[string]interface{}{
+			"type": "text",
+			"text": text,
+		})
+	}
+	if len(content) == 0 || (len(content) == 1 && text != "") {
+		return map[string]interface{}{
+			"role":    m.Role,
+			"content": text,
+		}
+	}
 	return map[string]interface{}{
 		"role":    m.Role,
 		"content": content,

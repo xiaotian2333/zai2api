@@ -156,6 +156,18 @@ func makeUpstreamRequest(token string, messages []Message, model string, imageUR
 		autoWebSearch = false
 	}
 
+	// 所有请求添加图片处理MCP服务器
+	vlmServers := []string{"vlm-image-search", "vlm-image-recognition", "vlm-image-processing"}
+	existingSet := make(map[string]bool)
+	for _, s := range mcpServers {
+		existingSet[s] = true
+	}
+	for _, s := range vlmServers {
+		if !existingSet[s] {
+			mcpServers = append(mcpServers, s)
+		}
+	}
+
 	latestUserContent := extractLatestUserContent(messages)
 
 	signature := GenerateSignature(userID, requestID, latestUserContent, timestamp)
@@ -988,16 +1000,18 @@ func handleStreamResponse(w http.ResponseWriter, body io.ReadCloser, completionI
 	if !hasContent {
 		LogError("Stream response 200 but no content received")
 	}
-
-	// 检测工具调用
 	stopReason := "stop"
 	var toolCalls []ToolCall
 	if len(tools) > 0 {
-		toolCalls = ExtractToolInvocations(fullContent.String())
+		rawContent := fullContent.String()
+		toolCalls = ExtractToolInvocations(rawContent)
 		if len(toolCalls) > 0 {
 			stopReason = "tool_calls"
-			// 发送工具调用 chunk
+			LogDebug("[Stream] Detected %d tool calls, sending tool_calls chunks", len(toolCalls))
 			for i, tc := range toolCalls {
+				if tc.ID == "" {
+					tc.ID = generateCallID()
+				}
 				toolChunk := ChatCompletionChunk{
 					ID:      completionID,
 					Object:  "chat.completion.chunk",
@@ -1037,8 +1051,6 @@ func handleStreamResponse(w http.ResponseWriter, body io.ReadCloser, completionI
 
 	finalData, _ := json.Marshal(finalChunk)
 	fmt.Fprintf(w, "data: %s\n\n", finalData)
-
-	// 发送 usage chunk（如果请求了）
 	if includeUsage {
 		usageChunk := ChatCompletionChunkResponse{
 			ID:      completionID,
@@ -1062,7 +1074,6 @@ func handleStreamResponse(w http.ResponseWriter, body io.ReadCloser, completionI
 }
 
 func handleNonStreamResponse(w http.ResponseWriter, body io.ReadCloser, completionID, modelName string, inputTokens int64, tools []Tool) int64 {
-	// 先设置响应头并 flush，让客户端知道请求已被接受
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("X-Request-Id", completionID)
 	if flusher, ok := w.(http.Flusher); ok {
@@ -1095,8 +1106,6 @@ func handleNonStreamResponse(w http.ResponseWriter, body io.ReadCloser, completi
 		if err := json.Unmarshal([]byte(payload), &upstream); err != nil {
 			continue
 		}
-
-		// 检测上游错误
 		if upstream.HasError() {
 			LogError("Upstream error: %s", upstream.GetErrorMessage())
 			chunks = append(chunks, fmt.Sprintf("[上游服务错误: %s]", upstream.GetErrorMessage()))
@@ -1143,7 +1152,6 @@ func handleNonStreamResponse(w http.ResponseWriter, body io.ReadCloser, completi
 			if textBeforeBlock != "" {
 				chunks = append(chunks, textBeforeBlock)
 			}
-			// 解析图片搜索结果
 			if results := ParseImageSearchResults(editContent); len(results) > 0 {
 				pendingImageSearchMarkdown = FormatImageSearchResults(results)
 			}
@@ -1209,20 +1217,15 @@ func handleNonStreamResponse(w http.ResponseWriter, body io.ReadCloser, completi
 	if fullContent == "" && fullReasoning == "" {
 		LogError("Non-stream response 200 but no content received")
 	}
-
-	// 检测工具调用
 	stopReason := "stop"
 	var toolCalls []ToolCall
 	if len(tools) > 0 {
 		toolCalls = ExtractToolInvocations(fullContent)
 		if len(toolCalls) > 0 {
 			stopReason = "tool_calls"
-			// 移除工具调用 JSON
 			fullContent = RemoveToolJSONContent(fullContent)
 		}
 	}
-
-	// 计算输出 token
 	outputTokens = CountTokens(fullContent) + CountTokens(fullReasoning)
 
 	response := ChatCompletionResponse{
@@ -1250,15 +1253,11 @@ func handleNonStreamResponse(w http.ResponseWriter, body io.ReadCloser, completi
 	json.NewEncoder(w).Encode(response)
 	return outputTokens
 }
-
-// handleStreamResponseWithRetry 流式响应处理（带重试支持）
 func handleStreamResponseWithRetry(w http.ResponseWriter, body io.ReadCloser, completionID, modelName string, inputTokens int64, includeUsage bool, tools []Tool, isFirstAttempt bool) UpstreamResult {
 	result := UpstreamResult{Success: true, HasContent: false}
 	var outputTokens int64
 	var fullContent strings.Builder
 	var upstreamError string
-
-	// 只在第一次尝试时设置响应头
 	if isFirstAttempt {
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.Header().Set("Cache-Control", "no-cache")
@@ -1272,8 +1271,6 @@ func handleStreamResponseWithRetry(w http.ResponseWriter, body io.ReadCloser, co
 		result.ErrorMessage = "streaming not supported"
 		return result
 	}
-
-	// 发送第一个 chunk 带 role
 	firstChunk := ChatCompletionChunk{
 		ID:      completionID,
 		Object:  "chat.completion.chunk",
@@ -1315,8 +1312,6 @@ func handleStreamResponseWithRetry(w http.ResponseWriter, body io.ReadCloser, co
 		if err := json.Unmarshal([]byte(payload), &upstream); err != nil {
 			continue
 		}
-
-		// 检测上游错误
 		if upstream.HasError() {
 			upstreamError = upstream.GetErrorMessage()
 			LogError("Upstream error: %s", upstreamError)
