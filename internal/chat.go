@@ -274,7 +274,6 @@ func makeUpstreamRequest(token string, messages []Message, model string, imageUR
 	}
 
 	randomIP := generateRandomIP()
-	userAgent := uarand.GetRandom()
 
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("X-FE-Version", GetFeVersion())
@@ -283,7 +282,7 @@ func makeUpstreamRequest(token string, messages []Message, model string, imageUR
 	req.Header.Set("Connection", "keep-alive")
 	req.Header.Set("Origin", "https://chat.z.ai")
 	req.Header.Set("Referer", fmt.Sprintf("https://chat.z.ai/c/%s", chatID))
-	req.Header.Set("User-Agent", userAgent)
+	req.Header.Set("User-Agent", uarand.GetRandom())
 	req.Header.Set("X-Forwarded-For", randomIP)
 	req.Header.Set("X-Real-IP", randomIP)
 
