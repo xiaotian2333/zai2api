@@ -160,7 +160,7 @@ func initBuiltinMappings() {
 		OwnedBy:           "z.ai",
 		IsBuiltin:         true,
 	}
-		modelMappings["GLM-5"] = ModelMapping{
+	modelMappings["GLM-5"] = ModelMapping{
 		DisplayName:       "GLM-5",
 		UpstreamModelID:   "glm-5",
 		UpstreamModelName: "GLM-5",
@@ -255,135 +255,111 @@ func fetchLatestModels() {
 	LogInfo("Fetched %d models from API", len(modelsResp.Data))
 }
 
-// supportedDynamicModelPrefixes 支持的动态模型前缀（上游 API v2 兼容）
-var supportedDynamicModelPrefixes = []string{
-	"glm-4-",  // 如 glm-4-xxx
-	"glm-4.5", // 如 glm-4.5-xxx
-	"glm-4.6", // 如 glm-4.6-xxx
-	"glm-4.7", // 如 glm-4.7-xxx
-	"0727-",   // 如 0727-360B-API
-	"0808-",   // 如 0808-360B-DR
-}
-
-// isSupportedDynamicModel 检查模型ID是否为支持的动态模型格式
-func isSupportedDynamicModel(modelID string) bool {
-	modelIDLower := strings.ToLower(modelID)
-	for _, prefix := range supportedDynamicModelPrefixes {
-		if strings.HasPrefix(modelIDLower, prefix) {
-			return true
-		}
+// inferModelConfig 根据模型名称自动推断配置
+func inferModelConfig(modelID string) (enableThinking bool, autoWebSearch bool, mcpServers []string) {
+	idLower := strings.ToLower(modelID)
+	enableThinking = true
+	autoWebSearch = true
+	mcpServers = []string{"advanced-search"}
+	if strings.Contains(idLower, "-v") {
+		mcpServers = append(mcpServers, "vlm-image-search", "vlm-image-recognition", "vlm-image-processing")
 	}
-	return false
+	return
 }
 
-// updateDynamicMappings 更新动态模型映射
+// updateDynamicMappings 更新动态模型映射，将从 API 拉取的新模型注册到映射表
 func updateDynamicMappings(models []ZAIModel) {
 	mappingsLock.Lock()
 	defer mappingsLock.Unlock()
 
-	// 获取已被内置映射使用的上游模型ID
-	usedUpstreamIDs := make(map[string]bool)
-	for _, m := range modelMappings {
-		if m.IsBuiltin {
-			usedUpstreamIDs[m.UpstreamModelID] = true
-		}
-	}
-
-	// 只为未被映射的模型添加动态映射
+	newCount := 0
 	for _, model := range models {
-		// 只保留 glm 开头的模型（不区分大小写）
-		modelIDLower := strings.ToLower(model.ID)
-		if !strings.HasPrefix(modelIDLower, "glm") {
+		idLower := strings.ToLower(model.ID)
+		if !strings.HasPrefix(idLower, "glm") {
 			continue
 		}
-		// 跳过已有内置映射的模型
 		if _, exists := modelMappings[model.ID]; exists {
 			continue
 		}
-		// 跳过已被映射的上游模型
-		if usedUpstreamIDs[model.ID] {
+		alreadyMapped := false
+		for existingID := range modelMappings {
+			if strings.EqualFold(existingID, model.ID) {
+				alreadyMapped = true
+				break
+			}
+		}
+		if alreadyMapped {
 			continue
 		}
-		// 跳过不支持的动态模型格式（避免 405 错误）
-		if !isSupportedDynamicModel(model.ID) {
-			LogDebug("Skipping unsupported dynamic model: %s", model.ID)
-			continue
-		}
-
-		// 设置 owned_by 默认值
-		ownedBy := model.OwnedBy
-		if ownedBy == "" || ownedBy == "openai" {
-			ownedBy = "z.ai"
-		}
-
-		// 设置显示名称
+		// 上游模型ID 格式化为显示名
 		displayName := model.Name
 		if displayName == "" {
 			displayName = model.ID
 		}
-
+		ownedBy := model.OwnedBy
+		if ownedBy == "" || ownedBy == "openai" {
+			ownedBy = "z.ai"
+		}
+		enableThinking, autoWebSearch, mcpServers := inferModelConfig(model.ID)
 		modelMappings[model.ID] = ModelMapping{
 			DisplayName:       displayName,
 			UpstreamModelID:   model.ID,
 			UpstreamModelName: displayName,
+			EnableThinking:    enableThinking,
+			AutoWebSearch:     autoWebSearch,
+			MCPServers:        mcpServers,
 			OwnedBy:           ownedBy,
 			IsBuiltin:         false,
 		}
+		newCount++
 	}
-}
-
-// modelsWithSuffixSupport 支持后缀组合的基础模型
-var modelsWithSuffixSupport = map[string]bool{
-	"GLM-4.5":     true,
-	"GLM-4.6":     true,
-	"GLM-4.7":     true,
-	"GLM-4.5-V":   true,
-	"GLM-4.6-V":   true,
-	"GLM-4.5-Air": true,
+	if newCount > 0 {
+		LogInfo("Registered %d new dynamic models", newCount)
+	}
 }
 
 // modelSuffixes 可用的后缀组合
 var modelSuffixes = []string{
-	"",                 // 基础
 	"-thinking",        // 思考
 	"-search",          // 搜索
 	"-thinking-search", // 思考+搜索
 }
 
-// GetAvailableModels 获取所有可用模型
+// isBaseSuffixModel 判断模型是否为基础模型（不含 -Thinking/-Search 后缀）从而可以生成后缀组合
+func isBaseSuffixModel(modelID string) bool {
+	idLower := strings.ToLower(modelID)
+	return !strings.HasSuffix(idLower, "-thinking") &&
+		!strings.HasSuffix(idLower, "-search") &&
+		!strings.HasSuffix(idLower, "-thinking-search")
+}
+
+// GetAvailableModels 获取所有可用模型，包括内置 + 动态 + 后缀组合
 func GetAvailableModels() []ModelInfo {
 	mappingsLock.RLock()
 	defer mappingsLock.RUnlock()
 
-	addedModels := make(map[string]bool)
+	seen := make(map[string]bool)
 	var models []ModelInfo
 
-	// 为支持后缀的模型生成所有组合
-	for baseModel := range modelsWithSuffixSupport {
-		if m, ok := modelMappings[baseModel]; ok {
-			for _, suffix := range modelSuffixes {
-				modelID := baseModel + suffix
-				if !addedModels[modelID] {
-					addedModels[modelID] = true
-					models = append(models, ModelInfo{
-						ID:      modelID,
-						Object:  "model",
-						OwnedBy: m.OwnedBy,
-					})
-				}
-			}
+	addModel := func(id, ownedBy string) {
+		key := strings.ToLower(id)
+		if seen[key] {
+			return
 		}
+		seen[key] = true
+		models = append(models, ModelInfo{
+			ID:      id,
+			Object:  "model",
+			OwnedBy: ownedBy,
+		})
 	}
 
-	// 添加其他已映射的模型
 	for id, m := range modelMappings {
-		if !addedModels[id] {
-			addedModels[id] = true
-			models = append(models, ModelInfo{
-				ID:      id,
-				Object:  "model",
-				OwnedBy: m.OwnedBy,
-			})
+		addModel(id, m.OwnedBy)
+		if isBaseSuffixModel(id) {
+			for _, suffix := range modelSuffixes {
+				addModel(id+suffix, m.OwnedBy)
+			}
 		}
 	}
 

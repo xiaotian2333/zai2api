@@ -1,96 +1,119 @@
 package internal
 
 import (
+	"context"
 	"fmt"
+	"io"
+	"log/slog"
+	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
 )
 
-type LogLevel int
-
-const (
-	DEBUG LogLevel = iota
-	INFO
-	WARN
-	ERROR
-)
-
 var (
-	currentLevel LogLevel = INFO
-	levelNames            = map[LogLevel]string{
-		DEBUG: "DEBUG",
-		INFO:  "INFO",
-		WARN:  "WARN",
-		ERROR: "ERROR",
-	}
-	// ANSI 颜色
-	levelColors = map[LogLevel]string{
-		DEBUG: "\033[36m", // 青色
-		INFO:  "\033[32m", // 绿色
-		WARN:  "\033[33m", // 黄色
-		ERROR: "\033[31m", // 红色
-	}
-	resetColor = "\033[0m"
+	logger   *slog.Logger
+	logLevel = new(slog.LevelVar)
+	logOnce  sync.Once
 )
 
-// InitLogger 初始化日志（从配置读取日志级别）
-func InitLogger() {
-	// 从配置读取日志级别
-	if Cfg != nil {
-		if Cfg.DebugLogging {
-			currentLevel = DEBUG
+type colorHandler struct {
+	writer io.Writer
+	level  *slog.LevelVar
+}
+
+var levelColorMap = map[slog.Level]string{
+	slog.LevelDebug: "\033[36m", // 青色
+	slog.LevelInfo:  "\033[32m", // 绿色
+	slog.LevelWarn:  "\033[33m", // 黄色
+	slog.LevelError: "\033[31m", // 红色
+}
+
+var levelNameMap = map[slog.Level]string{
+	slog.LevelDebug: "DEBUG",
+	slog.LevelInfo:  "INFO",
+	slog.LevelWarn:  "WARN",
+	slog.LevelError: "ERROR",
+}
+
+const resetColor = "\033[0m"
+
+func (h *colorHandler) Enabled(_ context.Context, level slog.Level) bool {
+	return level >= h.level.Level()
+}
+
+func (h *colorHandler) Handle(_ context.Context, r slog.Record) error {
+	timestamp := r.Time.Format("2006/01/02 15:04:05")
+	caller := "unknown.go"
+	if r.PC != 0 {
+		frames := runtime.CallersFrames([]uintptr{r.PC})
+		f, _ := frames.Next()
+		if f.File != "" {
+			caller = filepath.Base(f.File)
 		}
 	}
+	color := levelColorMap[r.Level]
+	name := levelNameMap[r.Level]
+	if name == "" {
+		name = r.Level.String()
+	}
+	fmt.Fprintf(h.writer, "%s [%s] %s[%s]%s %s\n", timestamp, caller, color, name, resetColor, r.Message)
+	return nil
+}
 
-	// 环境变量可覆盖配置
+func (h *colorHandler) WithAttrs(_ []slog.Attr) slog.Handler { return h }
+func (h *colorHandler) WithGroup(_ string) slog.Handler      { return h }
+
+func InitLogger() {
+	logOnce.Do(func() {
+		logLevel.Set(slog.LevelInfo)
+	})
+
+	if Cfg != nil && Cfg.DebugLogging {
+		logLevel.Set(slog.LevelDebug)
+	}
+
 	if level := getEnvString("LOG_LEVEL", ""); level != "" {
 		switch strings.ToLower(level) {
 		case "debug":
-			currentLevel = DEBUG
+			logLevel.Set(slog.LevelDebug)
 		case "warn":
-			currentLevel = WARN
+			logLevel.Set(slog.LevelWarn)
 		case "error":
-			currentLevel = ERROR
+			logLevel.Set(slog.LevelError)
 		default:
-			currentLevel = INFO
+			logLevel.Set(slog.LevelInfo)
 		}
 	}
+
+	logger = slog.New(&colorHandler{writer: os.Stdout, level: logLevel})
+	slog.SetDefault(logger)
 }
 
-// getCallerFile 获取调用者的文件名
-func getCallerFile(skip int) string {
-	_, file, _, ok := runtime.Caller(skip)
-	if !ok {
-		return "unknown.go"
-	}
-	return filepath.Base(file)
-}
-
-func log(level LogLevel, skip int, format string, v ...interface{}) {
-	if level < currentLevel {
+func logMsg(level slog.Level, format string, v ...interface{}) {
+	if !logger.Enabled(context.Background(), level) {
 		return
 	}
-	timestamp := time.Now().Format("2006/01/02 15:04:05")
-	caller := getCallerFile(skip)
-	msg := fmt.Sprintf(format, v...)
-	// 格式: 时间 [模块.go] [等级] 信息
-	fmt.Printf("%s [%s] %s[%s]%s %s\n", timestamp, caller, levelColors[level], levelNames[level], resetColor, msg)
+	var pcs [1]uintptr
+	runtime.Callers(3, pcs[:])
+	r := slog.NewRecord(time.Now(), level, fmt.Sprintf(format, v...), pcs[0])
+	_ = logger.Handler().Handle(context.Background(), r)
 }
 
 func LogDebug(format string, v ...interface{}) {
-	log(DEBUG, 2, format, v...)
+	logMsg(slog.LevelDebug, format, v...)
 }
 
 func LogInfo(format string, v ...interface{}) {
-	log(INFO, 2, format, v...)
+	logMsg(slog.LevelInfo, format, v...)
 }
 
 func LogWarn(format string, v ...interface{}) {
-	log(WARN, 2, format, v...)
+	logMsg(slog.LevelWarn, format, v...)
 }
 
 func LogError(format string, v ...interface{}) {
-	log(ERROR, 2, format, v...)
+	logMsg(slog.LevelError, format, v...)
 }

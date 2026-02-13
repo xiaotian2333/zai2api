@@ -1301,6 +1301,7 @@ func handleStreamResponseWithRetry(w http.ResponseWriter, body io.ReadCloser, co
 	pendingSourcesMarkdown := ""
 	pendingImageSearchMarkdown := ""
 	totalContentOutputLength := 0
+	hasTools := len(tools) > 0
 
 	for scanner.Scan() {
 		line := scanner.Text()
@@ -1598,6 +1599,10 @@ func handleStreamResponseWithRetry(w http.ResponseWriter, body io.ReadCloser, co
 			totalContentOutputLength += len([]rune(content))
 		}
 		fullContent.WriteString(content)
+		if hasTools {
+			outputTokens += CountTokens(content)
+			continue
+		}
 
 		chunk := ChatCompletionChunk{
 			ID:      completionID,
@@ -1620,26 +1625,26 @@ func handleStreamResponseWithRetry(w http.ResponseWriter, body io.ReadCloser, co
 	if remaining := searchRefFilter.Flush(); remaining != "" {
 		hasContent = true
 		fullContent.WriteString(remaining)
-		chunk := ChatCompletionChunk{
-			ID:      completionID,
-			Object:  "chat.completion.chunk",
-			Created: time.Now().Unix(),
-			Model:   modelName,
-			Choices: []Choice{{
-				Index:        0,
-				Delta:        &Delta{Content: remaining},
-				FinishReason: nil,
-			}},
+		if !hasTools {
+			chunk := ChatCompletionChunk{
+				ID:      completionID,
+				Object:  "chat.completion.chunk",
+				Created: time.Now().Unix(),
+				Model:   modelName,
+				Choices: []Choice{{
+					Index:        0,
+					Delta:        &Delta{Content: remaining},
+					FinishReason: nil,
+				}},
+			}
+			chunkData, _ := json.Marshal(chunk)
+			fmt.Fprintf(w, "data: %s\n\n", chunkData)
+			flusher.Flush()
 		}
-		chunkData, _ := json.Marshal(chunk)
-		fmt.Fprintf(w, "data: %s\n\n", chunkData)
-		flusher.Flush()
 	}
-
-	// 检测工具调用
 	stopReason := "stop"
 	var toolCalls []ToolCall
-	if len(tools) > 0 {
+	if hasTools {
 		toolCalls = ExtractToolInvocations(fullContent.String())
 		if len(toolCalls) > 0 {
 			stopReason = "tool_calls"
@@ -1664,6 +1669,25 @@ func handleStreamResponseWithRetry(w http.ResponseWriter, body io.ReadCloser, co
 				}
 				toolData, _ := json.Marshal(toolChunk)
 				fmt.Fprintf(w, "data: %s\n\n", toolData)
+				flusher.Flush()
+			}
+		} else {
+			// 未检测到工具调用，将缓冲的 content 作为普通内容发送
+			bufferedContent := RemoveToolJSONContent(fullContent.String())
+			if bufferedContent != "" {
+				chunk := ChatCompletionChunk{
+					ID:      completionID,
+					Object:  "chat.completion.chunk",
+					Created: time.Now().Unix(),
+					Model:   modelName,
+					Choices: []Choice{{
+						Index:        0,
+						Delta:        &Delta{Content: bufferedContent},
+						FinishReason: nil,
+					}},
+				}
+				chunkData, _ := json.Marshal(chunk)
+				fmt.Fprintf(w, "data: %s\n\n", chunkData)
 				flusher.Flush()
 			}
 		}

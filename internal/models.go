@@ -11,7 +11,7 @@ var BaseModelMapping = map[string]string{
 	"GLM-4.5":      "0727-360B-API",
 	"GLM-4.6":      "GLM-4-6-API-V1",
 	"GLM-4.7":      "glm-4.7",
-	"GLM-5":      "glm-5",
+	"GLM-5":        "glm-5",
 	"GLM-4.5-V":    "glm-4.5v",
 	"GLM-4.6-V":    "glm-4.6v",
 	"GLM-4.5-Air":  "0727-106B-API",
@@ -92,8 +92,10 @@ type MediaURL struct {
 
 type ImageURL = MediaURL
 type Message struct {
-	Role    string      `json:"role"`
-	Content interface{} `json:"content"` // string 或 []ContentPart
+	Role       string      `json:"role"`
+	Content    interface{} `json:"content"`                // string 或 []ContentPart
+	ToolCalls  []ToolCall  `json:"tool_calls,omitempty"`   // assistant 角色的工具调用
+	ToolCallID string      `json:"tool_call_id,omitempty"` // tool 角色的工具调用ID
 }
 
 func (m *Message) ParseContent() (text string, imageURLs []string) {

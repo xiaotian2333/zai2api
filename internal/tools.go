@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"regexp"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
@@ -30,9 +31,9 @@ type ToolCallFunction struct {
 }
 
 var (
-	toolCallFencePattern  = regexp.MustCompile("(?s)```json\\s*(\\{.*?\\})\\s*```")
-	functionCallPattern   = regexp.MustCompile(`(?s)调用函数\s*[：:]\s*([\w\-\.]+)\s*(?:参数|arguments)[：:]\s*(\{.*?\})`)
-	singleFunctionPattern = regexp.MustCompile(`(?s)\{\s*"name"\s*:\s*"([^"]+)"\s*,\s*"arguments"\s*:\s*(\{[^}]*\}|"[^"]*")\s*\}`)
+	toolCallFencePattern = regexp.MustCompile("(?s)```json\\s*(\\{.*?\\})\\s*```")
+	functionCallPattern  = regexp.MustCompile(`(?s)调用函数\s*[：:]\s*([\w\-\.]+)\s*(?:参数|arguments)[：:]\s*(\{.*?\})`)
+	callIDCounter        int64
 )
 
 func GenerateToolPrompt(tools []Tool, toolChoice interface{}) string {
@@ -105,7 +106,11 @@ func getToolChoiceInstructions(toolChoice interface{}, toolNames []string) strin
 **重要规则：**
 1. arguments 字段必须是 JSON 字符串（双引号包裹），不是对象
 2. 调用工具时只输出 JSON，不要添加任何解释文字
-3. 可以在 tool_calls 数组中同时调用多个工具`
+3. 可以在 tool_calls 数组中同时调用多个工具
+
+# 工具结果处理
+当你看到以 "[已执行工具调用]" 开头的助手消息和以 "[工具返回结果]" 开头的用户消息时，说明工具已经被调用并返回了结果。
+**此时你必须直接使用工具返回的数据来回答用户，绝对不要再次调用工具。**`
 
 	switch tc := toolChoice.(type) {
 	case string:
@@ -146,10 +151,10 @@ func ProcessMessagesWithTools(messages []Message, tools []Tool, toolChoice inter
 
 	processed := make([]Message, len(messages))
 	copy(processed, messages)
-
-	// 处理 tool 角色消息，转换为 user 消息
 	for i, msg := range processed {
-		if msg.Role == "tool" {
+		if msg.Role == "assistant" && len(msg.ToolCalls) > 0 {
+			processed[i] = convertAssistantToolCallMessage(msg)
+		} else if msg.Role == "tool" {
 			processed[i] = convertToolMessage(msg)
 		}
 	}
@@ -172,12 +177,34 @@ func ProcessMessagesWithTools(messages []Message, tools []Tool, toolChoice inter
 
 	return processed
 }
+func convertAssistantToolCallMessage(msg Message) Message {
+	content, _ := msg.ParseContent()
+	var sb strings.Builder
+	if content != "" {
+		sb.WriteString(content)
+		sb.WriteString("\n\n")
+	}
+	sb.WriteString("[已执行工具调用]\n")
+	for _, tc := range msg.ToolCalls {
+		sb.WriteString(fmt.Sprintf("- 调用了 %s，参数: %s (call_id: %s)\n", tc.Function.Name, tc.Function.Arguments, tc.ID))
+	}
+	return Message{
+		Role:    "assistant",
+		Content: sb.String(),
+	}
+}
 
 func convertToolMessage(msg Message) Message {
 	content, _ := msg.ParseContent()
+	var resultText string
+	if msg.ToolCallID != "" {
+		resultText = fmt.Sprintf("[工具返回结果] (call_id: %s)\n以下是工具返回的数据，请直接使用这些数据回答用户：\n%s", msg.ToolCallID, content)
+	} else {
+		resultText = fmt.Sprintf("[工具返回结果]\n以下是工具返回的数据，请直接使用这些数据回答用户：\n%s", content)
+	}
 	return Message{
 		Role:    "user",
-		Content: fmt.Sprintf("[工具调用结果]\n%s", content),
+		Content: resultText,
 	}
 }
 
@@ -219,6 +246,101 @@ func appendTextToContent(content interface{}, suffix string) interface{} {
 		return content
 	}
 }
+func findMatchingBrace(text string, start int) int {
+	if start >= len(text) || text[start] != '{' {
+		return -1
+	}
+	braceCount := 1
+	inString := false
+	escapeNext := false
+	j := start + 1
+	for j < len(text) && braceCount > 0 {
+		ch := text[j]
+		if escapeNext {
+			escapeNext = false
+			j++
+			continue
+		}
+		switch ch {
+		case '\\':
+			if inString {
+				escapeNext = true
+			}
+		case '"':
+			inString = !inString
+		case '{':
+			if !inString {
+				braceCount++
+			}
+		case '}':
+			if !inString {
+				braceCount--
+			}
+		}
+		j++
+	}
+	if braceCount != 0 {
+		return -1
+	}
+	return j
+}
+
+func normalizeArguments(args interface{}) string {
+	switch v := args.(type) {
+	case string:
+		v = strings.TrimSpace(v)
+		if v == "" {
+			return "{}"
+		}
+		// 验证是否为合法 JSON
+		var check json.RawMessage
+		if json.Unmarshal([]byte(v), &check) == nil {
+			return v
+		}
+		// 尝试修复常见的格式问题（单引号 -> 双引号）
+		fixed := strings.ReplaceAll(v, "'", "\"")
+		if json.Unmarshal([]byte(fixed), &check) == nil {
+			return fixed
+		}
+		return v
+	case map[string]interface{}:
+		if b, err := json.Marshal(v); err == nil {
+			return string(b)
+		}
+	case []interface{}:
+		if b, err := json.Marshal(v); err == nil {
+			return string(b)
+		}
+	case nil:
+		return "{}"
+	}
+	return "{}"
+}
+
+func validateAndNormalizeCalls(calls []ToolCall) []ToolCall {
+	if len(calls) == 0 {
+		return nil
+	}
+	var valid []ToolCall
+	for _, call := range calls {
+		if call.Function.Name == "" {
+			LogDebug("[Tools] Skipping tool call with empty function name")
+			continue
+		}
+		if call.ID == "" {
+			call.ID = generateCallID()
+		}
+		if call.Type == "" {
+			call.Type = "function"
+		}
+		call.Function.Arguments = normalizeArguments(call.Function.Arguments)
+		valid = append(valid, call)
+	}
+	if len(valid) == 0 {
+		return nil
+	}
+	return valid
+}
 
 // ExtractToolInvocations 从响应文本中提取工具调用
 func ExtractToolInvocations(text string) []ToolCall {
@@ -232,44 +354,43 @@ func ExtractToolInvocations(text string) []ToolCall {
 		scanText = scanText[:Cfg.ScanLimit]
 	}
 
-	// 方法1: 从 JSON fence 中提取
+	// 方法1: 从 JSON fence 中提取 ```json {...} ```
 	matches := toolCallFencePattern.FindAllStringSubmatch(scanText, -1)
 	for _, match := range matches {
 		if len(match) > 1 {
 			if calls := parseToolCallsJSON(match[1]); calls != nil {
 				LogDebug("[ExtractToolInvocations] Found %d tool calls in JSON fence", len(calls))
-				return calls
+				return validateAndNormalizeCalls(calls)
 			}
 		}
 	}
 
-	// 方法2: 提取内联 JSON
+	// 方法2: 提取内联 JSON（含 tool_calls 键）
 	if calls := extractInlineToolCalls(scanText); calls != nil {
 		LogDebug("[ExtractToolInvocations] Found %d tool calls inline", len(calls))
-		return calls
+		return validateAndNormalizeCalls(calls)
 	}
 
-	// 方法3: 提取单个函数调用格式 {"name":"...","arguments":"..."}
+	// 方法3: 提取单个函数调用格式 {"name":"...","arguments":...}
 	if calls := extractSingleFunctionCall(scanText); calls != nil {
 		LogDebug("[ExtractToolInvocations] Found single function call")
-		return calls
+		return validateAndNormalizeCalls(calls)
 	}
 
 	// 方法4: 解析自然语言函数调用
 	if match := functionCallPattern.FindStringSubmatch(scanText); len(match) > 2 {
 		funcName := strings.TrimSpace(match[1])
 		argsStr := strings.TrimSpace(match[2])
-		var args interface{}
-		if err := json.Unmarshal([]byte(argsStr), &args); err == nil {
+		var check json.RawMessage
+		if json.Unmarshal([]byte(argsStr), &check) == nil {
 			LogDebug("[ExtractToolInvocations] Found natural language function call: %s", funcName)
-			return []ToolCall{{
-				ID:   generateCallID(),
+			return validateAndNormalizeCalls([]ToolCall{{
 				Type: "function",
 				Function: ToolCallFunction{
 					Name:      funcName,
 					Arguments: argsStr,
 				},
-			}}
+			}})
 		}
 	}
 
@@ -277,33 +398,57 @@ func ExtractToolInvocations(text string) []ToolCall {
 }
 
 func extractSingleFunctionCall(text string) []ToolCall {
-	matches := singleFunctionPattern.FindStringSubmatch(text)
-	if len(matches) < 3 {
-		return nil
-	}
-
-	funcName := matches[1]
-	argsRaw := matches[2]
-
-	var argsStr string
-	if strings.HasPrefix(argsRaw, "\"") {
-		if err := json.Unmarshal([]byte(argsRaw), &argsStr); err != nil {
-			argsStr = argsRaw
+	// 查找 "name" 关键字定位候选位置
+	searchStart := 0
+	for {
+		idx := strings.Index(text[searchStart:], `"name"`)
+		if idx == -1 {
+			break
 		}
-	} else {
-		argsStr = argsRaw
+		idx += searchStart
+
+		// 向前查找最近的 {
+		braceStart := -1
+		for k := idx - 1; k >= 0; k-- {
+			ch := text[k]
+			if ch == '{' {
+				braceStart = k
+				break
+			}
+			if ch != ' ' && ch != '\t' && ch != '\n' && ch != '\r' {
+				break
+			}
+		}
+		if braceStart == -1 {
+			searchStart = idx + 1
+			continue
+		}
+
+		// 使用括号匹配找到完整 JSON 对象
+		end := findMatchingBrace(text, braceStart)
+		if end == -1 {
+			searchStart = idx + 1
+			continue
+		}
+
+		jsonStr := text[braceStart:end]
+		var raw struct {
+			Name      string      `json:"name"`
+			Arguments interface{} `json:"arguments"`
+		}
+		if err := json.Unmarshal([]byte(jsonStr), &raw); err == nil && raw.Name != "" {
+			return []ToolCall{{
+				Type: "function",
+				Function: ToolCallFunction{
+					Name:      raw.Name,
+					Arguments: normalizeArguments(raw.Arguments),
+				},
+			}}
+		}
+		searchStart = idx + 1
 	}
-
-	return []ToolCall{{
-		ID:   generateCallID(),
-		Type: "function",
-		Function: ToolCallFunction{
-			Name:      funcName,
-			Arguments: argsStr,
-		},
-	}}
+	return nil
 }
-
 func parseToolCallsJSON(jsonStr string) []ToolCall {
 	var data struct {
 		ToolCalls []struct {
@@ -324,79 +469,47 @@ func parseToolCallsJSON(jsonStr string) []ToolCall {
 			ID:   tc.ID,
 			Type: tc.Type,
 		}
-		if call.Type == "" {
-			call.Type = "function"
-		}
 		if fn, ok := tc.Function.(map[string]interface{}); ok {
 			call.Function.Name, _ = fn["name"].(string)
 			if args, ok := fn["arguments"]; ok {
-				switch v := args.(type) {
-				case string:
-					call.Function.Arguments = v
-				case map[string]interface{}:
-					if b, err := json.Marshal(v); err == nil {
-						call.Function.Arguments = string(b)
-					}
-				}
+				call.Function.Arguments = normalizeArguments(args)
+			} else {
+				call.Function.Arguments = "{}"
 			}
 		}
-
 		calls = append(calls, call)
 	}
-
 	return calls
 }
 
 func extractInlineToolCalls(text string) []ToolCall {
+	// 快速检查：文本中必须包含 tool_calls 关键字
+	if !strings.Contains(text, `"tool_calls"`) {
+		return nil
+	}
 	for i := 0; i < len(text); i++ {
 		if text[i] != '{' {
 			continue
 		}
-
-		// 找匹配的右括号
-		braceCount := 1
-		inString := false
-		escapeNext := false
-		j := i + 1
-
-		for j < len(text) && braceCount > 0 {
-			if escapeNext {
-				escapeNext = false
-				j++
-				continue
-			}
-
-			switch text[j] {
-			case '\\':
-				escapeNext = true
-			case '"':
-				if !escapeNext {
-					inString = !inString
-				}
-			case '{':
-				if !inString {
-					braceCount++
-				}
-			case '}':
-				if !inString {
-					braceCount--
-				}
-			}
-			j++
+		end := findMatchingBrace(text, i)
+		if end == -1 {
+			continue
 		}
-
-		if braceCount == 0 {
-			jsonStr := text[i:j]
+		jsonStr := text[i:end]
+		// 只解析包含 tool_calls 的 JSON 对象
+		if strings.Contains(jsonStr, `"tool_calls"`) {
 			if calls := parseToolCallsJSON(jsonStr); calls != nil {
 				return calls
 			}
 		}
+		// 跳过已扫描的部分
+		i = end - 1
 	}
-
 	return nil
 }
 
 func RemoveToolJSONContent(text string) string {
+	// 移除 ```json fence 中的 tool_calls
 	result := toolCallFencePattern.ReplaceAllStringFunc(text, func(match string) string {
 		submatch := toolCallFencePattern.FindStringSubmatch(match)
 		if len(submatch) > 1 {
@@ -409,70 +522,46 @@ func RemoveToolJSONContent(text string) string {
 		}
 		return match
 	})
+	// 移除内联 tool_calls JSON
 	result = removeInlineToolCallJSON(result)
-
 	return strings.TrimSpace(result)
 }
-
 func removeInlineToolCallJSON(text string) string {
+	if !strings.Contains(text, `"tool_calls"`) {
+		return text
+	}
 	var result strings.Builder
+	result.Grow(len(text))
 	i := 0
-
 	for i < len(text) {
 		if text[i] != '{' {
 			result.WriteByte(text[i])
 			i++
 			continue
 		}
-		braceCount := 1
-		inString := false
-		escapeNext := false
-		j := i + 1
-
-		for j < len(text) && braceCount > 0 {
-			if escapeNext {
-				escapeNext = false
-				j++
-				continue
-			}
-
-			switch text[j] {
-			case '\\':
-				escapeNext = true
-			case '"':
-				if !escapeNext {
-					inString = !inString
-				}
-			case '{':
-				if !inString {
-					braceCount++
-				}
-			case '}':
-				if !inString {
-					braceCount--
-				}
-			}
-			j++
+		end := findMatchingBrace(text, i)
+		if end == -1 {
+			result.WriteByte(text[i])
+			i++
+			continue
 		}
-
-		if braceCount == 0 {
-			jsonStr := text[i:j]
+		jsonStr := text[i:end]
+		if strings.Contains(jsonStr, `"tool_calls"`) {
 			var data map[string]interface{}
 			if err := json.Unmarshal([]byte(jsonStr), &data); err == nil {
 				if _, ok := data["tool_calls"]; ok {
-					i = j
+					i = end
 					continue
 				}
 			}
 		}
-
 		result.WriteByte(text[i])
 		i++
 	}
-
 	return result.String()
 }
 
 func generateCallID() string {
-	return fmt.Sprintf("call_%d", time.Now().UnixNano())
+	seq := atomic.AddInt64(&callIDCounter, 1)
+	return fmt.Sprintf("call_%d_%d", time.Now().UnixMilli(), seq)
 }
