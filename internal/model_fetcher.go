@@ -164,9 +164,9 @@ func initBuiltinMappings() {
 		DisplayName:       "GLM-5",
 		UpstreamModelID:   "glm-5",
 		UpstreamModelName: "GLM-5",
-		EnableThinking:    true,
-		AutoWebSearch:     true,
-		MCPServers:        []string{"advanced-search"},
+		EnableThinking:    false,
+		AutoWebSearch:     false,
+		MCPServers:        []string{},
 		OwnedBy:           "z.ai",
 		IsBuiltin:         true,
 	}
@@ -175,8 +175,8 @@ func initBuiltinMappings() {
 		UpstreamModelID:   "glm-5",
 		UpstreamModelName: "GLM-5-Thinking",
 		EnableThinking:    true,
-		AutoWebSearch:     true,
-		MCPServers:        []string{"advanced-search"},
+		AutoWebSearch:     false,
+		MCPServers:        []string{},
 		OwnedBy:           "z.ai",
 		IsBuiltin:         true,
 	}
